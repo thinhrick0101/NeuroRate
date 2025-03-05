@@ -312,7 +312,7 @@ class MultiHeadAttention(nn.Module):
         x = self.linear_out(x)
 
         return x
-class RMSNorm(nn.Module):
+    class RMSNorm(nn.Module):
     """
     Root Mean Square Layer Normalization
 
