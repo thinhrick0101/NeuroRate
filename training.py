@@ -197,7 +197,7 @@ def main():
     ).to(device)
     
     # Optimizer and loss function
-    optimizer = optim.Adam(model.parameters(), lr=1e-4)
+    optimizer = optim.AdamW(model.parameters(), lr=3e-4)
     
     # Replace with appropriate loss function for your task
     # For classification:
