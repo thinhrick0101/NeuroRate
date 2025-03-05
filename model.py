@@ -31,6 +31,71 @@ class SentenceEmbedding(nn.Module):
         self.END_TOKEN = END_TOKEN
         self.PADDING_TOKEN = PADDING_TOKEN
 
+    def batch_tokenize(self, batch, start_token, end_token):
+        """Tokenize a batch of sentences at character level"""
+        tokenized = []
+        for sentence in batch:
+            # Convert sentence to list of character tokens
+            sentence_tokens = [
+                self.language_to_index.get(
+                    token, self.language_to_index.get(self.PADDING_TOKEN)
+                )
+                for token in list(sentence)
+            ]
+
+            # Add special tokens if requested
+            if start_token:
+                sentence_tokens.insert(0, self.language_to_index[self.START_TOKEN])
+            if end_token:
+                sentence_tokens.append(self.language_to_index[self.END_TOKEN])
+
+            # Pad or truncate to max sequence length
+            if len(sentence_tokens) > self.max_sequence_length:
+                sentence_tokens = sentence_tokens[: self.max_sequence_length]
+            else:
+                padding = [self.language_to_index[self.PADDING_TOKEN]] * (
+                    self.max_sequence_length - len(sentence_tokens)
+                )
+                sentence_tokens.extend(padding)
+
+            tokenized.append(torch.tensor(sentence_tokens))
+
+        tokenized = torch.stack(tokenized)
+        return tokenized.to(get_device())
+
+    def forward(self, x, start_token, end_token):
+        """
+        Process input text into embeddings with positional encoding
+
+        Args:
+            x: Batch of input sentences
+            start_token: Whether to add start token
+            end_token: Whether to add end token
+
+        Returns:
+            Embedded representation with positional encoding
+        """
+        # Tokenize the input
+        x = self.batch_tokenize(x, start_token, end_token)
+
+        # Apply embedding
+        x = self.embedding(x)
+
+        # Create query/key tensors for positional encoding
+        batch_size, seq_len = x.shape[:2]
+        q = k = x.view(batch_size, seq_len, 1, -1)  # Add head dimension
+
+        # Apply positional encoding
+        q_rotated, k_rotated = self.position_encoder(q, k)
+
+        # Reshape back and use the positional encoded queries
+        x = q_rotated.squeeze(2)  # Remove head dimension
+
+        # Apply dropout
+        x = self.dropout(x)
+
+        return x
+
 
 class BERTSentenceEmbedding(nn.Module):
     """BERT-style sentence embedding with custom tokenizer"""
@@ -306,7 +371,7 @@ class RMSNorm(nn.Module):
 
 
 class EncodingLayer(nn.Module):
-    def __init__(self, d_model, num_heads, ff_dim, dropout=0.2):
+    def __init__(self, d_model, num_heads, dropout=0.2):
         super(EncodingLayer, self).__init__()
         self.norm1 = RMSNorm(d_model)
         self.norm2 = RMSNorm(d_model)
@@ -315,15 +380,31 @@ class EncodingLayer(nn.Module):
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
 
-    def forward(self, x, mask):
-        residual_x = x.clone()
-        x = self.attn(x, x, x, mask)
-        x = self.dropout1(x)
-        x = self.norm1(x + residual_x)
-        residual_x = x.clone()
-        x = self.ffn(x)
-        x = self.dropout2(x)
-        x = self.norm2(x + residual_x)
+    def forward(self, x, mask, pre_norm=True):
+        if pre_norm:
+            # Pre-norm version (more stable)
+            residual = x
+            x = self.norm1(x)
+            x = self.attn(x, x, x, mask)
+            x = self.dropout1(x)
+            x = residual + x
+
+            residual = x
+            x = self.norm2(x)
+            x = self.ffn(x)
+            x = self.dropout2(x)
+            x = residual + x
+        else:
+            # Post-norm version (original)
+            residual = x
+            x = self.attn(x, x, x, mask)
+            x = self.dropout1(x)
+            x = self.norm1(x + residual)
+
+            residual = x
+            x = self.ffn(x)
+            x = self.dropout2(x)
+            x = self.norm2(x + residual)
         return x
 
 
@@ -339,7 +420,6 @@ class Encoder(nn.Module):
     def __init__(
         self,
         d_model,
-        ffn_hidden,
         num_heads,
         drop_prob,
         num_layers,
@@ -373,10 +453,7 @@ class Encoder(nn.Module):
             )
 
         self.layers = SequentialEncoder(
-            *[
-                EncodingLayer(d_model, num_heads, ffn_hidden, drop_prob)
-                for _ in range(num_layers)
-            ]
+            *[EncodingLayer(d_model, num_heads, drop_prob) for _ in range(num_layers)]
         )
 
     def forward(self, x, self_attention_mask, start_token, end_token):
