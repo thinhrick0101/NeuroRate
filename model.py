@@ -3,6 +3,7 @@ import torch.nn as nn
 import math
 from bert_tokenizer import WordPieceTokenizer
 
+
 def get_device():
     return "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -29,35 +30,37 @@ class SentenceEmbedding(nn.Module):
         self.START_TOKEN = START_TOKEN
         self.END_TOKEN = END_TOKEN
         self.PADDING_TOKEN = PADDING_TOKEN
-        
+
+
 class BERTSentenceEmbedding(nn.Module):
     """BERT-style sentence embedding with custom tokenizer"""
+
     def __init__(self, max_sequence_length, d_model, vocab_file=None, corpus=None):
         super().__init__()
-        
+
         # Initialize the tokenizer
         self.tokenizer = WordPieceTokenizer(vocab_file)
         if corpus and not vocab_file:
             # Build vocabulary if corpus provided and no vocab file
             self.tokenizer.build_vocab(corpus)
-            
+
         # Set constants for compatibility
         self.max_sequence_length = max_sequence_length
         self.START_TOKEN = self.tokenizer.cls_token
         self.END_TOKEN = self.tokenizer.sep_token
         self.PADDING_TOKEN = self.tokenizer.pad_token
-        
+
         # Initialize embeddings
         self.vocab_size = self.tokenizer.vocab_size
         self.embedding = nn.Embedding(self.vocab_size, d_model)
-        
+
         # Position encoding and dropout
         self.position_encoder = PosEncoding(d_model, max_sequence_length)
         self.dropout = nn.Dropout(p=0.2)
-        
+
         # Map for vocabulary lookup
         self.language_to_index = self.tokenizer.vocab
-    
+
     def batch_tokenize(self, batch, start_token, end_token):
         """Tokenize a batch of sentences"""
         tokenized = []
@@ -66,59 +69,28 @@ class BERTSentenceEmbedding(nn.Module):
             token_ids = self.tokenizer.encode(
                 sentence,
                 max_length=self.max_sequence_length,
-                add_special_tokens=start_token or end_token
+                add_special_tokens=start_token or end_token,
             )
             tokenized.append(torch.tensor(token_ids))
-            
+
         tokenized = torch.stack(tokenized)
         return tokenized.to(get_device())
-    
+
     def forward(self, x, start_token, end_token):
         x = self.batch_tokenize(x, start_token, end_token)
         x = self.embedding(x)
-        
+
         # Create query/key tensors for position encoding
         batch_size, seq_len = x.shape[:2]
         q = k = x.view(batch_size, seq_len, 1, -1)  # Add head dimension
-        
+
         # Apply positional encoding
         q_rotated, k_rotated = self.position_encoder(q, k)
-        
+
         # Reshape back and use the positional encoded queries
         x = q_rotated.squeeze(2)  # Remove head dimension
-        
+
         x = self.dropout(x)
-        return x
-
-    def batch_tokenize(self, batch, start_token, end_token):
-
-        def tokenize(sentence, start_token, end_token):
-            sentence_word_indicies = [
-                self.language_to_index[token] for token in list(sentence)
-            ]
-            if start_token:
-                sentence_word_indicies.insert(
-                    0, self.language_to_index[self.START_TOKEN]
-                )
-            if end_token:
-                sentence_word_indicies.append(self.language_to_index[self.END_TOKEN])
-            for _ in range(len(sentence_word_indicies), self.max_sequence_length):
-                sentence_word_indicies.append(
-                    self.language_to_index[self.PADDING_TOKEN]
-                )
-            return torch.tensor(sentence_word_indicies)
-
-        tokenized = []
-        for sentence_num in range(len(batch)):
-            tokenized.append(tokenize(batch[sentence_num], start_token, end_token))
-        tokenized = torch.stack(tokenized)
-        return tokenized.to(get_device())
-
-    def forward(self, x, start_token, end_token):  # sentence
-        x = self.batch_tokenize(x, start_token, end_token)
-        x = self.embedding(x)
-        pos = self.position_encoder().to(get_device())
-        x = self.dropout(x + pos)
         return x
 
 
@@ -336,10 +308,10 @@ class RMSNorm(nn.Module):
 class EncodingLayer(nn.Module):
     def __init__(self, d_model, num_heads, ff_dim, dropout=0.2):
         super(EncodingLayer, self).__init__()
-        self.norm1 = nn.RMSNorm(d_model)
-        self.norm2 = nn.RMSNorm(d_model)
+        self.norm1 = RMSNorm(d_model)
+        self.norm2 = RMSNorm(d_model)
         self.attn = MultiHeadAttention(d_model, num_heads, dropout)
-        self.ffn = FFN(d_model, ff_dim, dropout)
+        self.ffn = FFN(d_model, dropout)
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
 
@@ -411,5 +383,3 @@ class Encoder(nn.Module):
         x = self.sentence_embedding(x, start_token, end_token)
         x = self.layers(x, self_attention_mask)
         return x
-
-
