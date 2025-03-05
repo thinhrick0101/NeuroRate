@@ -280,12 +280,10 @@ class MultiHeadAttention(nn.Module):
         self.num_heads = num_heads
         assert d_model % num_heads == 0  # Ensure d_model is divisible by num_heads
         self.head_dim = d_model // num_heads
-        self.dropout = nn.Dropout(dropout)
+        #self.dropout = nn.Dropout(dropout)
 
         # Linear transformations for Q, K, V
-        self.linear_q = nn.Linear(d_model, d_model, bias=False)
-        self.linear_k = nn.Linear(d_model, d_model, bias=False)
-        self.linear_v = nn.Linear(d_model, d_model, bias=False)
+        self.qkv = nn.Linear(d_model, d_model * 3)
 
         # Output linear transformation
         self.linear_out = nn.Linear(d_model, d_model)
@@ -293,40 +291,27 @@ class MultiHeadAttention(nn.Module):
         # Scaled dot-product attention
         self.scale = 1 / math.sqrt(self.head_dim)
 
-    def forward(self, q, k, v, mask=None):
-        batch_size = q.size(0)
-
-        # Linear transformation for Q, K, V
-        q = (
-            self.linear_q(q)
-            .view(batch_size, -1, self.num_heads, self.head_dim)
-            .transpose(1, 2)
-        )
-        k = (
-            self.linear_k(k)
-            .view(batch_size, -1, self.num_heads, self.head_dim)
-            .transpose(1, 2)
-        )
-        v = (
-            self.linear_v(v)
-            .view(batch_size, -1, self.num_heads, self.head_dim)
-            .transpose(1, 2)
-        )
+    def forward(self, x, mask=None):
+        B, T, C = x.size()
+        qkv = self.qkv(x)
+        q, k,v = qkv.split(self.d_model, dim = 2)
+        assert C % self.num_heads == 0, "d_model must be divisible by num_heads"
+        q = q.view(B, T, self.num_heads, C//self.num_heads).transpose(1, 2) # [B, num_heads, T, head_dim]
+        k = k.view(B, T, self.num_heads, C//self.num_heads).transpose(1, 2) # [B, num_heads, T, head_dim]
+        v = v.view(B, T, self.num_heads, C//self.num_heads).transpose(1, 2) # [B, num_heads, T, head_dim]
 
         # Scaled dot-product attention
         scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
         if mask is not None:
             scores = scores.masked_fill(mask == 0, -1e9)
         attention = torch.softmax(scores, dim=-1)
-        x = torch.matmul(self.dropout(attention), v)
+        x = torch.matmul(attention, v)
 
         # Concatenate and linear transformation
-        x = x.transpose(1, 2).contiguous().view(batch_size, -1, self.d_model)
+        x = x.transpose(1, 2).contiguous().view(B, T, C)
         x = self.linear_out(x)
 
         return x
-
-
 class RMSNorm(nn.Module):
     """
     Root Mean Square Layer Normalization
