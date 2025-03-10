@@ -390,7 +390,12 @@ class EncodingLayer(nn.Module):
             # Pre-norm version (more stable)
             residual = x
             x = self.norm1(x)
-            x = self.attn(x, x, x, mask)
+            ### Old one
+            ### x = self.attn(x, x, x, mask)
+            
+            ### Fix 
+            x = self.attn(x, mask)
+            
             x = self.dropout1(x)
             x = residual + x
 
