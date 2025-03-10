@@ -179,21 +179,21 @@ class PosEncoding(nn.Module):
         self.init_rope_matrix()
 
     def init_rope_matrix(self):
-        # Create frequency tensor based on head dimension
-        theta = 10000.0 ** (-torch.arange(0, self.head_dim, 2).float() / self.head_dim)
+        # We need embeddings for half the dimensions since we apply them separately to even and odd indices
+        half_dim = self.head_dim // 2
+
+        # Create frequency tensor based on half the head dimension
+        theta = 10000.0 ** (-torch.arange(0, half_dim).float() / half_dim)
 
         # Create position tensor
         pos = torch.arange(self.seq_len).float().unsqueeze(1)  # [seq_len, 1]
 
         # Compute angle for each position and frequency
-        angles = pos * theta  # Shape: [seq_len, head_dim/2]
+        angles = pos * theta  # Shape: [seq_len, half_dim]
 
-        # Compute sin and cos for interleaved format
-        sin_emb = torch.sin(angles).repeat_interleave(2, dim=1)  # [seq_len, head_dim]
-        cos_emb = torch.cos(angles).repeat_interleave(2, dim=1)  # [seq_len, head_dim]
-
-        self.sin_emb = sin_emb
-        self.cos_emb = cos_emb
+        # Compute sin and cos for the half dimension
+        self.sin_emb = torch.sin(angles)  # [seq_len, half_dim]
+        self.cos_emb = torch.cos(angles)  # [seq_len, half_dim]
 
     def forward(self, q, k):
         """
@@ -216,26 +216,14 @@ class PosEncoding(nn.Module):
         # Ensure correct shape for sin and cos embeddings
         sin_emb = (
             self.sin_emb[:seq_len].unsqueeze(0).unsqueeze(2)
-        )  # [1, seq_len, 1, head_dim]
+        )  # [1, seq_len, 1, half_dim]
         cos_emb = (
             self.cos_emb[:seq_len].unsqueeze(0).unsqueeze(2)
-        )  # [1, seq_len, 1, head_dim]
+        )  # [1, seq_len, 1, half_dim]
 
         # Even indices: x, Odd indices: y
         q_even, q_odd = q[..., ::2], q[..., 1::2]  # Split into even-odd pairs
         k_even, k_odd = k[..., ::2], k[..., 1::2]
-
-
-        ### An issue is found when the last dimension of q_even, q_odd is not the same
-        ### with the cos_emb and sin_emb. The last dimension of cos_emb is twice the 
-        ### last dimension of q_even
-
-        ### A potential fix
-        cos_emb = cos_emb[..., ::2]
-        sin_emb = sin_emb[..., ::2]
-        
-        ### Or we can change the head_dim property to
-        ### self.head_dim = head_dim / 2
 
         # RoPE transformation
         q_rotated = torch.cat(
@@ -320,8 +308,13 @@ class MultiHeadAttention(nn.Module):
 
         # Scaled dot-product attention
         scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+
+        # Apply mask if provided - mask should now have correct shape for broadcasting
         if mask is not None:
+            # Make sure mask shape is compatible with scores
+            # mask shape: [B, 1, 1, T] will broadcast to [B, num_heads, T, T]
             scores = scores.masked_fill(mask == 0, -1e9)
+
         attention = torch.softmax(scores, dim=-1)
         x = torch.matmul(attention, v)
 
@@ -392,10 +385,10 @@ class EncodingLayer(nn.Module):
             x = self.norm1(x)
             ### Old one
             ### x = self.attn(x, x, x, mask)
-            
-            ### Fix 
+
+            ### Fix
             x = self.attn(x, mask)
-            
+
             x = self.dropout1(x)
             x = residual + x
 
@@ -441,6 +434,7 @@ class Encoder(nn.Module):
         use_bert_tokenization=False,
         corpus=None,
         vocab_file=None,
+        num_classes=2,  # Default to binary classification
     ):
         super().__init__()
 
@@ -466,7 +460,29 @@ class Encoder(nn.Module):
             *[EncodingLayer(d_model, num_heads, drop_prob) for _ in range(num_layers)]
         )
 
+        # Add classification head
+        self.classifier = nn.Linear(d_model, num_classes)
+        self.norm = RMSNorm(d_model)
+        self.pooling_type = "cls"  # Options: 'cls', 'mean', 'max'
+
     def forward(self, x, self_attention_mask, start_token, end_token):
+        # Embedding and transformer layers
         x = self.sentence_embedding(x, start_token, end_token)
         x = self.layers(x, self_attention_mask)
-        return x
+
+        # Pooling - extract features for classification
+        if self.pooling_type == "cls":
+            # Use the first token (CLS token) representation
+            pooled = x[:, 0]
+        elif self.pooling_type == "mean":
+            # Average over sequence dimension
+            pooled = torch.mean(x, dim=1)
+        elif self.pooling_type == "max":
+            # Max pooling over sequence dimension
+            pooled, _ = torch.max(x, dim=1)
+
+        # Normalize and classify
+        pooled = self.norm(pooled)
+        logits = self.classifier(pooled)
+
+        return logits
