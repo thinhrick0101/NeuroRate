@@ -280,7 +280,7 @@ class MultiHeadAttention(nn.Module):
         self.num_heads = num_heads
         assert d_model % num_heads == 0  # Ensure d_model is divisible by num_heads
         self.head_dim = d_model // num_heads
-        #self.dropout = nn.Dropout(dropout)
+        # self.dropout = nn.Dropout(dropout)
 
         # Linear transformations for Q, K, V
         self.qkv = nn.Linear(d_model, d_model * 3)
@@ -294,11 +294,17 @@ class MultiHeadAttention(nn.Module):
     def forward(self, x, mask=None):
         B, T, C = x.size()
         qkv = self.qkv(x)
-        q, k,v = qkv.split(self.d_model, dim = 2)
+        q, k, v = qkv.split(self.d_model, dim=2)
         assert C % self.num_heads == 0, "d_model must be divisible by num_heads"
-        q = q.view(B, T, self.num_heads, C//self.num_heads).transpose(1, 2) # [B, num_heads, T, head_dim]
-        k = k.view(B, T, self.num_heads, C//self.num_heads).transpose(1, 2) # [B, num_heads, T, head_dim]
-        v = v.view(B, T, self.num_heads, C//self.num_heads).transpose(1, 2) # [B, num_heads, T, head_dim]
+        q = q.view(B, T, self.num_heads, C // self.num_heads).transpose(
+            1, 2
+        )  # [B, num_heads, T, head_dim]
+        k = k.view(B, T, self.num_heads, C // self.num_heads).transpose(
+            1, 2
+        )  # [B, num_heads, T, head_dim]
+        v = v.view(B, T, self.num_heads, C // self.num_heads).transpose(
+            1, 2
+        )  # [B, num_heads, T, head_dim]
 
         # Scaled dot-product attention
         scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
@@ -312,7 +318,9 @@ class MultiHeadAttention(nn.Module):
         x = self.linear_out(x)
 
         return x
-    class RMSNorm(nn.Module):
+
+
+class RMSNorm(nn.Module):
     """
     Root Mean Square Layer Normalization
 
