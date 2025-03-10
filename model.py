@@ -225,6 +225,18 @@ class PosEncoding(nn.Module):
         q_even, q_odd = q[..., ::2], q[..., 1::2]  # Split into even-odd pairs
         k_even, k_odd = k[..., ::2], k[..., 1::2]
 
+
+        ### An issue is found when the last dimension of q_even, q_odd is not the same
+        ### with the cos_emb and sin_emb. The last dimension of cos_emb is twice the 
+        ### last dimension of q_even
+
+        ### A potential fix
+        cos_emb = cos_emb[..., ::2]
+        sin_emb = sin_emb[..., ::2]
+        
+        ### Or we can change the head_dim property to
+        ### self.head_dim = head_dim / 2
+
         # RoPE transformation
         q_rotated = torch.cat(
             [
