@@ -235,6 +235,13 @@ def main():
     for text, rating in zip(val_ds_raw["text"], val_ds_raw["rating"]):
         val_texts.append(text)
         val_labels.append(rating)
+        
+    train_dataset = TextDataset(
+        train_texts, train_labels, max_length=config.max_position_embeddings
+    )
+    val_dataset = TextDataset(
+        val_texts, val_labels, max_length=config.max_position_embeddings
+    )
 
     # Create data loaders
     train_loader = DataLoader(
