@@ -48,7 +48,7 @@ class TextDataset(Dataset):
         return item
 
 
-def collate_fn(batch, tokenizer=None, max_length=512, device="cuda"):
+def collate_fn(batch, tokenizer=None, max_length=512, device="cuda", config:Config=None):
     texts = [item["text"] for item in batch]
     # If we're doing classification, also collect labels
     has_labels = "label" in batch[0]
@@ -60,7 +60,7 @@ def collate_fn(batch, tokenizer=None, max_length=512, device="cuda"):
     batch_dict = {
         "texts": texts,
         "attention_mask": torch.ones(
-            (len(texts), max_length, max_length), device=device
+            (len(texts), config.num_heads, max_length, max_length), device=device
         ),
     }
 
@@ -232,7 +232,7 @@ def main():
         batch_size=8,
         shuffle=True,
         collate_fn=lambda batch: collate_fn(
-            batch, max_length=config.max_position_embeddings, device=device
+            batch, max_length=config.max_position_embeddings, device=device, config=config
         ),
     )
 
@@ -241,7 +241,7 @@ def main():
         batch_size=8,
         shuffle=False,
         collate_fn=lambda batch: collate_fn(
-            batch, max_length=config.max_position_embeddings, device=device
+            batch, max_length=config.max_position_embeddings, device=device, config=config
         ),
     )
 
