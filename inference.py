@@ -6,7 +6,7 @@ from model_config import Config
 config = Config()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Initialize model
+# Initialize model - include num_classes
 model = Encoder(
     d_model=config.hidden_size,
     num_heads=config.num_heads,
@@ -14,6 +14,7 @@ model = Encoder(
     num_layers=config.Layer,
     max_sequence_length=config.max_position_embeddings,
     use_bert_tokenization=True,
+    num_classes=2,  # Set based on your classification task
 ).to(device)
 
 # Load trained model weights
@@ -25,17 +26,17 @@ model.eval()
 # Perform inference
 def predict(text):
     with torch.no_grad():
-        # Create attention mask for a single input
+        # Create proper attention mask for a single input
+        # Shape: [1, 1, 1, max_length]
         attention_mask = torch.ones(
-            (1, config.max_position_embeddings, config.max_position_embeddings),
+            (1, 1, 1, config.max_position_embeddings),
             device=device,
         )
 
         # Forward pass
         outputs = model([text], attention_mask, start_token=True, end_token=True)
 
-        # Process outputs based on your task
-        # For classification:
+        # Get prediction
         predictions = torch.argmax(outputs, dim=1)
 
     return predictions.item()

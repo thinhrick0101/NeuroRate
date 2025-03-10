@@ -48,20 +48,21 @@ class TextDataset(Dataset):
         return item
 
 
-def collate_fn(batch, tokenizer=None, max_length=512, device="cuda", config:Config=None):
+def collate_fn(
+    batch, tokenizer=None, max_length=512, device="cuda", config: Config = None
+):
     texts = [item["text"] for item in batch]
     # If we're doing classification, also collect labels
     has_labels = "label" in batch[0]
 
-    # Create attention masks based on pad token
-    attention_masks = []
+    # Create a proper attention mask for transformer models
+    # Shape: [batch_size, 1, 1, max_length] - broadcastable to attention scores
+    attention_mask = torch.ones((len(texts), 1, 1, max_length), device=device)
 
     # Convert to tensors and create dict
     batch_dict = {
         "texts": texts,
-        "attention_mask": torch.ones(
-            (len(texts), config.num_heads, max_length, max_length), device=device
-        ),
+        "attention_mask": attention_mask,
     }
 
     if has_labels:
@@ -232,7 +233,10 @@ def main():
         batch_size=8,
         shuffle=True,
         collate_fn=lambda batch: collate_fn(
-            batch, max_length=config.max_position_embeddings, device=device, config=config
+            batch,
+            max_length=config.max_position_embeddings,
+            device=device,
+            config=config,
         ),
     )
 
@@ -241,7 +245,10 @@ def main():
         batch_size=8,
         shuffle=False,
         collate_fn=lambda batch: collate_fn(
-            batch, max_length=config.max_position_embeddings, device=device, config=config
+            batch,
+            max_length=config.max_position_embeddings,
+            device=device,
+            config=config,
         ),
     )
 
@@ -250,6 +257,10 @@ def main():
 
     # Build vocabulary from training corpus if needed
     # tokenizer.build_vocab(train_texts)
+
+    # Calculate number of classes from labels
+    num_classes = len(set(train_labels))
+    logger.info(f"Detected {num_classes} classes in dataset")
 
     # Model initialization
     model = Encoder(
@@ -260,6 +271,7 @@ def main():
         max_sequence_length=config.max_position_embeddings,
         use_bert_tokenization=True,
         corpus=train_texts,  # Build vocabulary from training corpus
+        num_classes=num_classes,  # Pass number of classes
     ).to(device)
 
     # Optimizer and loss function
