@@ -14,6 +14,8 @@ from bert_tokenizer import WordPieceTokenizer
 import matplotlib.pyplot as plt
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
+from datasets import load_dataset
+
 # Set up logging
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -213,19 +215,26 @@ def main():
 
     # Data loading
     # Replace with your actual data loading logic
-    train_texts = ["This is a sample text", "Another sample"]
-    train_labels = [1, 0]  # For classification tasks
+    dataset = load_dataset("McAuley-Lab/Amazon-Reviews-2023", "raw_review_All_Beauty", trust_remote_code=True)
 
-    val_texts = ["A validation sample", "Second validation sample"]
-    val_labels = [0, 1]
+    ds_raw = dataset["full"].select_columns(["text","rating"])
+    ds_raw = ds_raw.select(range(20000))
+    
+    test_ds_raw, val_ds_raw = ds_raw.train_test_split(test_size=0.1).values()
 
-    # Create datasets
-    train_dataset = TextDataset(
-        train_texts, train_labels, max_length=config.max_position_embeddings
-    )
-    val_dataset = TextDataset(
-        val_texts, val_labels, max_length=config.max_position_embeddings
-    )
+    train_texts = []
+    train_labels = []
+    
+    val_texts = []
+    val_labels = []
+
+    for text, rating in zip(test_ds_raw["text"], test_ds_raw["rating"]):
+        train_texts.append(text)
+        train_labels.append(rating)
+        
+    for text, rating in zip(val_ds_raw["text"], val_ds_raw["rating"]):
+        val_texts.append(text)
+        val_labels.append(rating)
 
     # Create data loaders
     train_loader = DataLoader(
