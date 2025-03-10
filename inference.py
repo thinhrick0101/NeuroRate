@@ -36,12 +36,13 @@ def predict(text):
         # Forward pass
         outputs = model([text], attention_mask, start_token=True, end_token=True)
 
-        # Get prediction
-        predictions = torch.argmax(outputs, dim=1)
+        # Get prediction (add 1 since we subtracted 1 during training)
+        predicted_class = torch.argmax(outputs, dim=1).item()
+        rating = predicted_class + 1  # Convert back to 1-5 rating scale
 
-    return predictions.item()
+    return rating
 
 
 # Example usage
 result = predict("Sample text to classify")
-print(f"Prediction: {result}")
+print(f"Predicted rating: {result}/5")

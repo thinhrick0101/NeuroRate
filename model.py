@@ -190,7 +190,7 @@ class PosEncoding(nn.Module):
 
         # Compute angle for each position and frequency
         angles = pos * theta  # Shape: [seq_len, half_dim]
-
+        
         # Compute sin and cos for the half dimension
         self.sin_emb = torch.sin(angles)  # [seq_len, half_dim]
         self.cos_emb = torch.cos(angles)  # [seq_len, half_dim]
@@ -434,7 +434,7 @@ class Encoder(nn.Module):
         use_bert_tokenization=False,
         corpus=None,
         vocab_file=None,
-        num_classes=2,  # Default to binary classification
+        num_classes=5, 
     ):
         super().__init__()
 

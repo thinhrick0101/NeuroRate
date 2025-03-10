@@ -68,43 +68,53 @@ def collate_fn(
     }
 
     if has_labels:
-        labels = torch.tensor([item["label"] for item in batch], device=device)
+        # Adjust labels to be zero-indexed (Amazon ratings are 1-5, we need 0-4) [0,num_class-1]
+        labels = torch.tensor(
+            [item["label"] - 1 for item in batch], device=device
+        ).long()
         batch_dict["labels"] = labels
 
     return batch_dict
 
 
-def train_epoch(model, dataloader, optimizer, criterion, device):
+def train_epoch(
+    model, dataloader, optimizer, criterion, device, gradient_accumulation_steps=4
+):
     model.train()
     total_loss = 0
+    optimizer.zero_grad()  # Zero gradients once at the beginning
 
     progress_bar = tqdm(dataloader, desc="Training")
-    for batch in progress_bar:
+    for i, batch in enumerate(progress_bar):
         # Get inputs
         texts = batch["texts"]
         attention_mask = batch["attention_mask"]
         labels = batch.get("labels")
-
-        # Zero gradients
-        optimizer.zero_grad()
 
         # Forward pass
         outputs = model(texts, attention_mask, start_token=True, end_token=True)
 
         # If we have labels, calculate loss
         if labels is not None:
-            loss = criterion(outputs, labels)
+            loss = (
+                criterion(outputs, labels) / gradient_accumulation_steps
+            )  # Normalize loss
         else:
             # For unsupervised learning, you might use a different loss function
-            # This is just a placeholder
-            loss = criterion(outputs)
+            loss = criterion(outputs) / gradient_accumulation_steps
 
-        # Backward pass and optimize
+        # Backward pass
         loss.backward()
-        optimizer.step()
+
+        # Only update weights periodically to save memory
+        if (i + 1) % gradient_accumulation_steps == 0 or (i + 1) == len(dataloader):
+            optimizer.step()
+            optimizer.zero_grad()
 
         # Update metrics
-        total_loss += loss.item()
+        total_loss += (
+            loss.item() * gradient_accumulation_steps
+        )  # De-normalize for tracking
         progress_bar.set_postfix({"loss": f"{total_loss/(progress_bar.n+1):.4f}"})
 
     return total_loss / len(dataloader)
@@ -213,29 +223,52 @@ def main():
     config = Config()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    # Memory saving settings
+    gradient_accumulation_steps = 4
+    batch_size = 4  # Reduced from 8
+
+    # Empty cache before starting
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     # Data loading
     # Replace with your actual data loading logic
-    dataset = load_dataset("McAuley-Lab/Amazon-Reviews-2023", "raw_review_All_Beauty", trust_remote_code=True)
+    dataset = load_dataset(
+        "McAuley-Lab/Amazon-Reviews-2023",
+        "raw_review_All_Beauty",
+        trust_remote_code=True,
+    )
 
-    ds_raw = dataset["full"].select_columns(["text","rating"])
+    ds_raw = dataset["full"].select_columns(["text", "rating"])
     ds_raw = ds_raw.select(range(20000))
-    
+
     test_ds_raw, val_ds_raw = ds_raw.train_test_split(test_size=0.1).values()
 
     train_texts = []
     train_labels = []
-    
+
     val_texts = []
     val_labels = []
 
     for text, rating in zip(test_ds_raw["text"], test_ds_raw["rating"]):
         train_texts.append(text)
         train_labels.append(rating)
-        
+
     for text, rating in zip(val_ds_raw["text"], val_ds_raw["rating"]):
         val_texts.append(text)
         val_labels.append(rating)
-        
+
+    # When processing Amazon ratings, ensure they're in the valid range
+    for i, rating in enumerate(train_labels):
+        if rating < 1 or rating > 5:
+            logger.warning(f"Found invalid rating {rating}, setting to 3")
+            train_labels[i] = 3
+
+    for i, rating in enumerate(val_labels):
+        if rating < 1 or rating > 5:
+            logger.warning(f"Found invalid rating {rating}, setting to 3")
+            val_labels[i] = 3
+
     train_dataset = TextDataset(
         train_texts, train_labels, max_length=config.max_position_embeddings
     )
@@ -243,10 +276,10 @@ def main():
         val_texts, val_labels, max_length=config.max_position_embeddings
     )
 
-    # Create data loaders
+    # Create data loaders with smaller batch size
     train_loader = DataLoader(
-        train_texts,
-        batch_size=8,
+        train_dataset,
+        batch_size=batch_size,
         shuffle=True,
         collate_fn=lambda batch: collate_fn(
             batch,
@@ -257,8 +290,8 @@ def main():
     )
 
     val_loader = DataLoader(
-        val_texts,
-        batch_size=8,
+        val_dataset,
+        batch_size=batch_size,
         shuffle=False,
         collate_fn=lambda batch: collate_fn(
             batch,
@@ -274,9 +307,9 @@ def main():
     # Build vocabulary from training corpus if needed
     # tokenizer.build_vocab(train_texts)
 
-    # Calculate number of classes from labels
-    num_classes = len(set(train_labels))
-    logger.info(f"Detected {num_classes} classes in dataset")
+    # Calculate number of classes from labels - Amazon ratings are 1-5
+    num_classes = 5
+    logger.info(f"Using {num_classes} classes for classification")
 
     # Model initialization
     model = Encoder(
@@ -315,8 +348,15 @@ def main():
 
     # Training loop
     for epoch in range(start_epoch, num_epochs):
-        # Train
-        train_loss = train_epoch(model, train_loader, optimizer, criterion, device)
+        # Train with gradient accumulation
+        train_loss = train_epoch(
+            model,
+            train_loader,
+            optimizer,
+            criterion,
+            device,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+        )
         logger.info(f"Epoch {epoch+1}/{num_epochs} - Train loss: {train_loss:.4f}")
 
         # Evaluate
@@ -325,6 +365,10 @@ def main():
 
         # Update learning rate scheduler
         scheduler.step(val_loss)
+
+        # Log the current learning rate using get_last_lr
+        current_lr = scheduler.optimizer.param_groups[0]["lr"]
+        logger.info(f"Current learning rate: {current_lr}")
 
         # Update history
         history["train_loss"].append(train_loss)
