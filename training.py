@@ -238,7 +238,7 @@ def main():
 
     # Create data loaders
     train_loader = DataLoader(
-        train_dataset,
+        train_texts,
         batch_size=8,
         shuffle=True,
         collate_fn=lambda batch: collate_fn(
@@ -250,7 +250,7 @@ def main():
     )
 
     val_loader = DataLoader(
-        val_dataset,
+        val_texts,
         batch_size=8,
         shuffle=False,
         collate_fn=lambda batch: collate_fn(
