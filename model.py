@@ -477,12 +477,53 @@ class Encoder(nn.Module):
         self.norm = RMSNorm(d_model)
         self.pooling_type = "cls"  # Options: 'cls', 'mean', 'max'
 
+        # Improve model with additional regularization
+        self.input_dropout = nn.Dropout(drop_prob + 0.1)  # Higher dropout at input
+
+        # Add layer normalization before pooling
+        self.pre_pooling_norm = RMSNorm(d_model)
+
+        # Enhance classifier with a better head
+        self.classifier = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Dropout(drop_prob),
+            nn.Linear(d_model // 2, num_classes),
+        )
+
+        # Initialize weights properly
+        self.apply(self._init_weights)
+
+        # Support for different pooling strategies
+        self.pooling_type = "weighted"  # Options: 'cls', 'mean', 'max', 'weighted'
+        if self.pooling_type == "weighted":
+            # Learnable weights for attention pooling
+            self.attention_pool = nn.Linear(d_model, 1)
+
+    def _init_weights(self, module):
+        """Initialize the weights"""
+        if isinstance(module, nn.Linear):
+            # Use Xavier/Glorot initialization for linear layers
+            nn.init.xavier_uniform_(module.weight)
+            if module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.Embedding):
+            module.weight.data.normal_(mean=0.0, std=0.02)
+
     def forward(self, x, self_attention_mask, start_token, end_token):
         # Embedding and transformer layers
         x = self.sentence_embedding(x, start_token, end_token)
+
+        # Apply input dropout for regularization
+        x = self.input_dropout(x)
+
+        # Process through transformer layers
         x = self.layers(x, self_attention_mask)
 
-        # Pooling - extract features for classification
+        # Apply normalization
+        x = self.pre_pooling_norm(x)
+
+        # Enhanced pooling - extract features for classification
         if self.pooling_type == "cls":
             # Use the first token (CLS token) representation
             pooled = x[:, 0]
@@ -492,9 +533,13 @@ class Encoder(nn.Module):
         elif self.pooling_type == "max":
             # Max pooling over sequence dimension
             pooled, _ = torch.max(x, dim=1)
+        elif self.pooling_type == "weighted":
+            # Weighted pooling (attention-based)
+            attention_scores = self.attention_pool(x).squeeze(-1)
+            attention_weights = torch.softmax(attention_scores, dim=1).unsqueeze(-1)
+            pooled = torch.sum(x * attention_weights, dim=1)
 
-        # Normalize and classify
-        pooled = self.norm(pooled)
+        # Classify with improved classification head
         logits = self.classifier(pooled)
 
         return logits
