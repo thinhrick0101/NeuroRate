@@ -1,4 +1,5 @@
 import torch
+import os
 from model import Encoder
 from model_config import Config
 
@@ -6,21 +7,58 @@ from model_config import Config
 config = Config()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Initialize model - include num_classes
-model = Encoder(
-    d_model=config.hidden_size,
-    num_heads=config.num_heads,
-    drop_prob=config.hidden_dropout_prob,
-    num_layers=config.Layer,
-    max_sequence_length=config.max_position_embeddings,
-    use_bert_tokenization=True,
-    num_classes=5,  # Set based on your classification task
-).to(device)
 
-# Load trained model weights
-checkpoint = torch.load("checkpoints/best_model.pt")
-model.load_state_dict(checkpoint["model_state_dict"])
-model.eval()
+def load_model(checkpoint_path, device):
+    """
+    Load trained model with proper vocabulary size
+    """
+    print(f"Loading model from {checkpoint_path}...")
+
+    # Load checkpoint with weights_only=True for security
+    checkpoint = torch.load(checkpoint_path, weights_only=True)
+
+    # Get the state dictionary to extract the embedding size
+    state_dict = checkpoint["model_state_dict"]
+
+    # Extract vocabulary size from the embedding weight matrix
+    vocab_size = state_dict["sentence_embedding.embedding.weight"].shape[0]
+    print(f"Detected vocabulary size: {vocab_size}")
+
+    # Initialize model with the correct vocabulary size
+    model = Encoder(
+        d_model=config.hidden_size,
+        num_heads=config.num_heads,
+        drop_prob=config.hidden_dropout_prob,
+        num_layers=config.Layer,
+        max_sequence_length=config.max_position_embeddings,
+        use_bert_tokenization=True,
+        num_classes=5,  # For Amazon ratings (1-5)
+        custom_vocab_size=vocab_size,  # Pass the detected vocab size
+    ).to(device)
+
+    # Load the state dictionary
+    model.load_state_dict(state_dict)
+    model.eval()
+
+    return model
+
+
+# Load the trained model
+checkpoint_path = "checkpoints/best_model.pt"
+if os.path.exists(checkpoint_path):
+    model = load_model(checkpoint_path, device)
+else:
+    print(f"Warning: No model found at {checkpoint_path}. Using untrained model.")
+    # Initialize a default model if no checkpoint is available
+    model = Encoder(
+        d_model=config.hidden_size,
+        num_heads=config.num_heads,
+        drop_prob=config.hidden_dropout_prob,
+        num_layers=config.Layer,
+        max_sequence_length=config.max_position_embeddings,
+        use_bert_tokenization=True,
+        num_classes=5,
+    ).to(device)
 
 
 # Perform inference
@@ -44,5 +82,11 @@ def predict(text):
 
 
 # Example usage
-result = predict("Sample text to classify")
-print(f"Predicted rating: {result}/5")
+if __name__ == "__main__":
+    sample_text = "This product exceeded my expectations. The quality is excellent!"
+    result = predict(sample_text)
+    print(f"Predicted rating: {result}/5")
+
+    negative_text = "Terrible product, broke after one use. Would not recommend."
+    result = predict(negative_text)
+    print(f"Predicted rating: {result}/5")

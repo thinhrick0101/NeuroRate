@@ -100,7 +100,14 @@ class SentenceEmbedding(nn.Module):
 class BERTSentenceEmbedding(nn.Module):
     """BERT-style sentence embedding with custom tokenizer"""
 
-    def __init__(self, max_sequence_length, d_model, vocab_file=None, corpus=None):
+    def __init__(
+        self,
+        max_sequence_length,
+        d_model,
+        vocab_file=None,
+        corpus=None,
+        custom_vocab_size=None,
+    ):
         super().__init__()
 
         # Initialize the tokenizer
@@ -115,8 +122,12 @@ class BERTSentenceEmbedding(nn.Module):
         self.END_TOKEN = self.tokenizer.sep_token
         self.PADDING_TOKEN = self.tokenizer.pad_token
 
-        # Initialize embeddings
-        self.vocab_size = self.tokenizer.vocab_size
+        # Initialize embeddings with custom vocab size if provided
+        self.vocab_size = (
+            custom_vocab_size
+            if custom_vocab_size is not None
+            else self.tokenizer.vocab_size
+        )
         self.embedding = nn.Embedding(self.vocab_size, d_model)
 
         # Position encoding and dropout
@@ -190,7 +201,7 @@ class PosEncoding(nn.Module):
 
         # Compute angle for each position and frequency
         angles = pos * theta  # Shape: [seq_len, half_dim]
-        
+
         # Compute sin and cos for the half dimension
         self.sin_emb = torch.sin(angles)  # [seq_len, half_dim]
         self.cos_emb = torch.cos(angles)  # [seq_len, half_dim]
@@ -434,13 +445,14 @@ class Encoder(nn.Module):
         use_bert_tokenization=False,
         corpus=None,
         vocab_file=None,
-        num_classes=5, 
+        num_classes=5,
+        custom_vocab_size=None,  # Add parameter for custom vocab size
     ):
         super().__init__()
 
         if use_bert_tokenization:
             self.sentence_embedding = BERTSentenceEmbedding(
-                max_sequence_length, d_model, vocab_file, corpus
+                max_sequence_length, d_model, vocab_file, corpus, custom_vocab_size
             )
             # Get special tokens from the tokenizer
             START_TOKEN = self.sentence_embedding.START_TOKEN
