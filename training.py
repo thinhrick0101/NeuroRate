@@ -1,18 +1,23 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 import os
 import json
 import logging
 from tqdm import tqdm
 import numpy as np
 import random
+import re
 from model import Encoder
 from model_config import Config
 from bert_tokenizer import WordPieceTokenizer
 import matplotlib.pyplot as plt
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.optim.lr_scheduler import ReduceLROnPlateau, OneCycleLR
+from collections import Counter
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import confusion_matrix, classification_report, accuracy_score
+import seaborn as sns
 
 from datasets import load_dataset
 
@@ -82,6 +87,8 @@ def train_epoch(
 ):
     model.train()
     total_loss = 0
+    all_preds = []
+    all_labels = []
     optimizer.zero_grad()  # Zero gradients once at the beginning
 
     progress_bar = tqdm(dataloader, desc="Training")
@@ -99,6 +106,10 @@ def train_epoch(
             loss = (
                 criterion(outputs, labels) / gradient_accumulation_steps
             )  # Normalize loss
+            # Store predictions and labels for metrics
+            preds = torch.argmax(outputs, dim=1)
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
         else:
             # For unsupervised learning, you might use a different loss function
             loss = criterion(outputs) / gradient_accumulation_steps
@@ -108,6 +119,8 @@ def train_epoch(
 
         # Only update weights periodically to save memory
         if (i + 1) % gradient_accumulation_steps == 0 or (i + 1) == len(dataloader):
+            # Clip gradients to prevent exploding gradients
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             optimizer.zero_grad()
 
@@ -117,12 +130,20 @@ def train_epoch(
         )  # De-normalize for tracking
         progress_bar.set_postfix({"loss": f"{total_loss/(progress_bar.n+1):.4f}"})
 
-    return total_loss / len(dataloader)
+    # Calculate accuracy if we have labels
+    metrics = {}
+    if all_labels and all_preds:
+        metrics["accuracy"] = accuracy_score(all_labels, all_preds)
+        logger.info(f"Training accuracy: {metrics['accuracy']:.4f}")
+
+    return total_loss / len(dataloader), metrics
 
 
 def evaluate(model, dataloader, criterion, device):
     model.eval()
     total_loss = 0
+    all_preds = []
+    all_labels = []
 
     with torch.no_grad():
         for batch in tqdm(dataloader, desc="Evaluating"):
@@ -137,13 +158,30 @@ def evaluate(model, dataloader, criterion, device):
             # Calculate loss
             if labels is not None:
                 loss = criterion(outputs, labels)
+                # Store predictions and labels for metrics
+                preds = torch.argmax(outputs, dim=1)
+                all_preds.extend(preds.cpu().numpy())
+                all_labels.extend(labels.cpu().numpy())
             else:
                 loss = criterion(outputs)
 
             # Update metrics
             total_loss += loss.item()
 
-    return total_loss / len(dataloader)
+    # Calculate additional metrics
+    metrics = {}
+    if all_labels and all_preds:
+        metrics["accuracy"] = accuracy_score(all_labels, all_preds)
+        metrics["predictions"] = all_preds
+        metrics["labels"] = all_labels
+
+        logger.info(f"Validation accuracy: {metrics['accuracy']:.4f}")
+
+        # Generate classification report for more details
+        report = classification_report(all_labels, all_preds, zero_division=0)
+        logger.info(f"Classification Report:\n{report}")
+
+    return total_loss / len(dataloader), metrics
 
 
 def save_checkpoint(model, optimizer, scheduler, epoch, loss, history, filepath):
@@ -215,6 +253,107 @@ def plot_training_history(history, save_path="training_history.png"):
     logger.info(f"Training history plot saved to {save_path}")
 
 
+def clean_text(text):
+    """Clean and normalize text data"""
+    if not isinstance(text, str):
+        return ""
+
+    # Remove HTML tags
+    text = re.sub(r"<.*?>", "", text)
+
+    # Convert to lowercase
+    text = text.lower()
+
+    # Remove excessive whitespace
+    text = re.sub(r"\s+", " ", text)
+
+    # Remove URLs
+    text = re.sub(r"http\S+|www\S+|https\S+", "", text)
+
+    # Remove non-alphanumeric characters (but keep spaces)
+    text = re.sub(r"[^\w\s]", "", text)
+
+    return text.strip()
+
+
+def create_balanced_sampler(labels):
+    """Create a weighted sampler to balance classes in training"""
+    # Count class frequencies
+    class_counts = Counter(labels)
+    logger.info(f"Class distribution: {class_counts}")
+
+    # Calculate weights for each sample
+    weights = [1.0 / class_counts[label] for label in labels]
+
+    # Create WeightedRandomSampler
+    sampler = WeightedRandomSampler(weights, len(labels))
+    return sampler
+
+
+def log_dataset_statistics(texts, labels, split_name="Dataset"):
+    """Log statistics about the dataset"""
+    if not texts or not labels:
+        return
+
+    # Text length statistics
+    text_lengths = [len(text.split()) for text in texts]
+    avg_length = sum(text_lengths) / len(text_lengths)
+    max_length = max(text_lengths)
+    min_length = min(text_lengths)
+
+    # Label distribution
+    label_counts = Counter(labels)
+
+    # Log statistics
+    logger.info(f"\n{split_name} Statistics:")
+    logger.info(f"Number of samples: {len(texts)}")
+    logger.info(f"Average text length: {avg_length:.2f} words")
+    logger.info(f"Min/Max text length: {min_length}/{max_length} words")
+    logger.info(f"Label distribution: {label_counts}")
+
+    # Create and save distribution plot
+    if split_name != "Dataset":
+        plt.figure(figsize=(8, 5))
+        plt.bar(label_counts.keys(), label_counts.values())
+        plt.title(f"{split_name} Rating Distribution")
+        plt.xlabel("Rating")
+        plt.ylabel("Count")
+        plt.savefig(f"checkpoints/{split_name.lower()}_distribution.png")
+        plt.close()
+
+
+def plot_confusion_matrix(
+    labels, predictions, epoch, save_path="checkpoints/confusion_matrix.png"
+):
+    """Plot and save confusion matrix"""
+    # Convert predictions to actual ratings (add 1 since we subtracted 1 for 0-indexing)
+    actual_labels = [label + 1 for label in labels]
+    actual_predictions = [pred + 1 for pred in predictions]
+
+    # Create confusion matrix
+    cm = confusion_matrix(actual_labels, actual_predictions)
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(
+        cm,
+        annot=True,
+        fmt="d",
+        cmap="Blues",
+        xticklabels=range(1, 6),
+        yticklabels=range(1, 6),
+    )
+    plt.xlabel("Predicted Rating")
+    plt.ylabel("True Rating")
+    plt.title(f"Confusion Matrix - Epoch {epoch+1}")
+
+    # Save the figure
+    plt.tight_layout()
+    plt.savefig(f"checkpoints/confusion_matrix_epoch_{epoch+1}.png")
+    plt.close()
+    logger.info(
+        f"Confusion matrix saved to checkpoints/confusion_matrix_epoch_{epoch+1}.png"
+    )
+
+
 def main():
     # Set random seed
     set_seed(42)
@@ -226,6 +365,11 @@ def main():
     # Memory saving settings
     gradient_accumulation_steps = 4
     batch_size = 4  # Reduced from 8
+
+    # Training settings - moved earlier to avoid NameError
+    num_epochs = 25
+    checkpoint_path = "checkpoints/best_model.pt"
+    history_path = "checkpoints/training_history.png"
 
     # Empty cache before starting
     if torch.cuda.is_available():
@@ -242,21 +386,28 @@ def main():
     ds_raw = dataset["full"].select_columns(["text", "rating"])
     ds_raw = ds_raw.select(range(20000))
 
-    test_ds_raw, val_ds_raw = ds_raw.train_test_split(test_size=0.1).values()
+    # Extract texts and ratings
+    texts = [clean_text(text) for text in ds_raw["text"]]
+    ratings = list(ds_raw["rating"])
 
-    train_texts = []
-    train_labels = []
+    # Remove empty texts and corresponding ratings
+    filtered_data = [
+        (text, rating) for text, rating in zip(texts, ratings) if text.strip()
+    ]
 
-    val_texts = []
-    val_labels = []
+    # Check if any data was filtered out
+    if len(filtered_data) < len(texts):
+        logger.info(f"Removed {len(texts) - len(filtered_data)} empty text samples")
 
-    for text, rating in zip(test_ds_raw["text"], test_ds_raw["rating"]):
-        train_texts.append(text)
-        train_labels.append(rating)
+    texts, ratings = zip(*filtered_data) if filtered_data else ([], [])
 
-    for text, rating in zip(val_ds_raw["text"], val_ds_raw["rating"]):
-        val_texts.append(text)
-        val_labels.append(rating)
+    # Log overall dataset statistics
+    log_dataset_statistics(texts, ratings, "Overall Dataset")
+
+    # Use stratified sampling to maintain rating distribution
+    train_texts, val_texts, train_labels, val_labels = train_test_split(
+        texts, ratings, test_size=0.1, random_state=42, stratify=ratings
+    )
 
     # When processing Amazon ratings, ensure they're in the valid range
     for i, rating in enumerate(train_labels):
@@ -269,6 +420,10 @@ def main():
             logger.warning(f"Found invalid rating {rating}, setting to 3")
             val_labels[i] = 3
 
+    # Log statistics for train and validation sets
+    log_dataset_statistics(train_texts, train_labels, "Training Set")
+    log_dataset_statistics(val_texts, val_labels, "Validation Set")
+
     train_dataset = TextDataset(
         train_texts, train_labels, max_length=config.max_position_embeddings
     )
@@ -276,11 +431,14 @@ def main():
         val_texts, val_labels, max_length=config.max_position_embeddings
     )
 
+    # Create balanced sampler for training data
+    train_sampler = create_balanced_sampler(train_labels)
+
     # Create data loaders with smaller batch size
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=True,
+        sampler=train_sampler,  # Use balanced sampler instead of shuffle=True
         collate_fn=lambda batch: collate_fn(
             batch,
             max_length=config.max_position_embeddings,
@@ -301,12 +459,6 @@ def main():
         ),
     )
 
-    # Initialize tokenizer
-    tokenizer = WordPieceTokenizer(vocab_size=config.vocab_size)
-
-    # Build vocabulary from training corpus if needed
-    # tokenizer.build_vocab(train_texts)
-
     # Calculate number of classes from labels - Amazon ratings are 1-5
     num_classes = 5
     logger.info(f"Using {num_classes} classes for classification")
@@ -323,23 +475,39 @@ def main():
         num_classes=num_classes,  # Pass number of classes
     ).to(device)
 
-    # Optimizer and loss function
-    optimizer = optim.AdamW(model.parameters(), lr=3e-4)
-    criterion = nn.CrossEntropyLoss()
-
-    # Add learning rate scheduler
-    scheduler = ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=2, verbose=True
+    # Optimizer and loss function with label smoothing
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=3e-4,
+        weight_decay=1e-2,  # Reduced weight decay
+        betas=(0.9, 0.999),  # Default betas
     )
 
-    # Setup for early stopping
-    early_stopping_patience = 5
-    early_stopping_counter = 0
+    # Use label smoothing for better regularization
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
-    # Training settings
-    num_epochs = 10
-    checkpoint_path = "checkpoints/best_model.pt"
-    history_path = "checkpoints/training_history.png"
+    # Add learning rate scheduler
+    # Instead of ReduceLROnPlateau, use OneCycleLR for better convergence
+    total_steps = len(train_loader) * num_epochs
+    scheduler = OneCycleLR(
+        optimizer,
+        max_lr=3e-4,
+        total_steps=total_steps,
+        pct_start=0.1,  # Warmup for 10% of training
+        anneal_strategy="cos",
+        div_factor=25.0,
+        final_div_factor=10000.0,
+    )
+
+    # Let's keep ReduceLROnPlateau as a backup if you prefer it
+    # scheduler = ReduceLROnPlateau(
+    #    optimizer, mode="min", factor=0.5, patience=3, verbose=True
+    # )
+
+    # Setup for early stopping - now using both loss and accuracy
+    early_stopping_patience = 10
+    early_stopping_counter = 0
+    best_val_accuracy = 0.0
 
     # Try to resume from checkpoint
     model, optimizer, scheduler, start_epoch, best_val_loss, history = load_checkpoint(
@@ -349,7 +517,7 @@ def main():
     # Training loop
     for epoch in range(start_epoch, num_epochs):
         # Train with gradient accumulation
-        train_loss = train_epoch(
+        train_loss, train_metrics = train_epoch(
             model,
             train_loader,
             optimizer,
@@ -360,19 +528,32 @@ def main():
         logger.info(f"Epoch {epoch+1}/{num_epochs} - Train loss: {train_loss:.4f}")
 
         # Evaluate
-        val_loss = evaluate(model, val_loader, criterion, device)
+        val_loss, val_metrics = evaluate(model, val_loader, criterion, device)
         logger.info(f"Epoch {epoch+1}/{num_epochs} - Validation loss: {val_loss:.4f}")
 
+        # Plot confusion matrix using validation predictions
+        if "predictions" in val_metrics and "labels" in val_metrics:
+            plot_confusion_matrix(
+                val_metrics["labels"], val_metrics["predictions"], epoch
+            )
+
         # Update learning rate scheduler
-        scheduler.step(val_loss)
+        if isinstance(scheduler, ReduceLROnPlateau):
+            scheduler.step(val_loss)
+            current_lr = scheduler.optimizer.param_groups[0]["lr"]
+            logger.info(f"Current learning rate: {current_lr}")
+        else:
+            # If using OneCycleLR, no need to call step here as it's called after each batch
+            current_lr = optimizer.param_groups[0]["lr"]
+            logger.info(f"Current learning rate: {current_lr}")
 
-        # Log the current learning rate using get_last_lr
-        current_lr = scheduler.optimizer.param_groups[0]["lr"]
-        logger.info(f"Current learning rate: {current_lr}")
-
-        # Update history
+        # Update history with metrics
         history["train_loss"].append(train_loss)
         history["val_loss"].append(val_loss)
+        if "accuracy" in train_metrics:
+            history.setdefault("train_accuracy", []).append(train_metrics["accuracy"])
+        if "accuracy" in val_metrics:
+            history.setdefault("val_accuracy", []).append(val_metrics["accuracy"])
 
         # Save periodic checkpoint (every 5 epochs)
         if (epoch + 1) % 5 == 0:
@@ -386,29 +567,86 @@ def main():
                 f"checkpoints/model_epoch_{epoch+1}.pt",
             )
 
-        # Save best model
+        # Save best model (based on both loss and accuracy)
+        improved = False
+
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            early_stopping_counter = 0
+            improved = True
+            save_checkpoint(
+                model,
+                optimizer,
+                scheduler,
+                epoch,
+                val_loss,
+                history,
+                "checkpoints/best_loss_model.pt",
+            )
+            logger.info(f"New best validation loss: {val_loss:.4f}")
+
+        if "accuracy" in val_metrics and val_metrics["accuracy"] > best_val_accuracy:
+            best_val_accuracy = val_metrics["accuracy"]
+            improved = True
+            save_checkpoint(
+                model,
+                optimizer,
+                scheduler,
+                epoch,
+                val_loss,
+                history,
+                "checkpoints/best_accuracy_model.pt",
+            )
+            logger.info(f"New best validation accuracy: {val_metrics['accuracy']:.4f}")
+
+        # If either loss or accuracy improved, save as overall best model
+        if improved:
             save_checkpoint(
                 model, optimizer, scheduler, epoch, val_loss, history, checkpoint_path
             )
-            logger.info(f"New best validation loss: {val_loss:.4f}")
+            early_stopping_counter = 0
         else:
             early_stopping_counter += 1
             logger.info(
-                f"Validation loss did not improve. Counter: {early_stopping_counter}/{early_stopping_patience}"
+                f"Validation metrics did not improve. Counter: {early_stopping_counter}/{early_stopping_patience}"
             )
 
             if early_stopping_counter >= early_stopping_patience:
                 logger.info("Early stopping triggered!")
                 break
 
-    # Plot and save training history
-    plot_training_history(history, history_path)
+    # Enhanced plot for training history
+    plot_enhanced_training_history(history, history_path)
 
     logger.info("Training completed!")
     return best_val_loss
+
+
+def plot_enhanced_training_history(history, save_path="training_history.png"):
+    """Plot and save enhanced training history with multiple metrics"""
+    fig, axes = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
+
+    # Loss subplot
+    axes[0].plot(history["train_loss"], label="Training Loss")
+    axes[0].plot(history["val_loss"], label="Validation Loss")
+    axes[0].set_ylabel("Loss")
+    axes[0].set_title("Training and Validation Loss")
+    axes[0].legend()
+    axes[0].grid(True)
+
+    # Accuracy subplot (if available)
+    if "train_accuracy" in history and "val_accuracy" in history:
+        axes[1].plot(history["train_accuracy"], label="Training Accuracy")
+        axes[1].plot(history["val_accuracy"], label="Validation Accuracy")
+        axes[1].set_ylabel("Accuracy")
+        axes[1].set_title("Training and Validation Accuracy")
+        axes[1].legend()
+        axes[1].grid(True)
+
+    plt.xlabel("Epochs")
+    plt.tight_layout()
+    plt.savefig(save_path)
+    logger.info(f"Enhanced training history plot saved to {save_path}")
+    plt.close()
 
 
 if __name__ == "__main__":
