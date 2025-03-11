@@ -14,7 +14,7 @@ model = Encoder(
     num_layers=config.Layer,
     max_sequence_length=config.max_position_embeddings,
     use_bert_tokenization=True,
-    num_classes=2,  # Set based on your classification task
+    num_classes=5,  # Set based on your classification task
 ).to(device)
 
 # Load trained model weights
