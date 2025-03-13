@@ -11,7 +11,7 @@ import random
 import re
 from model import Encoder
 from model_config import Config
-from bert_tokenizer import WordPieceTokenizer
+from transformers import BertTokenizer, BertTokenizerFast
 import matplotlib.pyplot as plt
 from torch.optim.lr_scheduler import ReduceLROnPlateau, OneCycleLR
 from collections import Counter
@@ -20,6 +20,35 @@ from sklearn.metrics import confusion_matrix, classification_report, accuracy_sc
 import seaborn as sns
 
 from datasets import load_dataset
+
+# ...existing imports...
+import torch.nn.functional as F  # if not already imported
+
+
+# NEW CLASS: FocalLoss
+class FocalLoss(nn.Module):
+    """
+    Focal Loss for addressing class imbalance.
+    Focuses training on hard examples.
+    """
+
+    def __init__(self, gamma=2.0, weight=None, reduction="mean"):
+        super(FocalLoss, self).__init__()
+        self.gamma = gamma
+        self.weight = weight
+        self.reduction = reduction
+
+    def forward(self, input, target):
+        ce_loss = F.cross_entropy(input, target, weight=self.weight, reduction="none")
+        pt = torch.exp(-ce_loss)
+        focal_loss = (1 - pt) ** self.gamma * ce_loss
+        if self.reduction == "mean":
+            return focal_loss.mean()
+        elif self.reduction == "sum":
+            return focal_loss.sum()
+        else:
+            return focal_loss
+
 
 # Set up logging
 logging.basicConfig(
@@ -83,7 +112,13 @@ def collate_fn(
 
 
 def train_epoch(
-    model, dataloader, optimizer, criterion, device, gradient_accumulation_steps=4
+    model,
+    dataloader,
+    optimizer,
+    criterion,
+    device,
+    gradient_accumulation_steps=4,
+    scheduler=None,
 ):
     model.train()
     total_loss = 0
@@ -122,6 +157,7 @@ def train_epoch(
             # Clip gradients to prevent exploding gradients
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
+            scheduler.step()  # Important! Call scheduler.step() after optimizer.step()
             optimizer.zero_grad()
 
         # Update metrics
@@ -290,6 +326,26 @@ def create_balanced_sampler(labels):
     return sampler
 
 
+# NEW FUNCTION: create_class_weight
+def create_class_weight(labels, num_classes=5):
+    """Compute class weights from label frequencies."""
+    from collections import Counter
+
+    count = Counter(labels)
+    total = len(labels)
+    class_weights = {}
+    for cls in range(num_classes):
+        if cls in count:
+            class_weights[cls] = total / (count[cls] * num_classes)
+        else:
+            class_weights[cls] = 1.0
+    max_weight = max(class_weights.values())
+    for cls in class_weights:
+        class_weights[cls] = min(5.0, class_weights[cls] / max_weight)
+    logger.info(f"Class weights: {class_weights}")
+    return class_weights
+
+
 def log_dataset_statistics(texts, labels, split_name="Dataset"):
     """Log statistics about the dataset"""
     if not texts or not labels:
@@ -354,6 +410,71 @@ def plot_confusion_matrix(
     )
 
 
+def train_and_save_tokenizer(
+    texts,
+    vocab_size=30000,
+    min_frequency=2,
+    save_path="checkpoints/tokenizer_vocab.txt",
+):
+    """
+    Train a BERT tokenizer from scratch and save its vocabulary
+
+    Args:
+        texts: List of texts to train the tokenizer on
+        vocab_size: Maximum vocabulary size
+        min_frequency: Minimum frequency for a token to be included
+        save_path: Path to save the vocabulary file
+
+    Returns:
+        Trained BERT Tokenizer
+    """
+    from transformers import BertTokenizerFast, BertTokenizer
+
+    logger.info(
+        f"Training BERT tokenizer with vocab_size={vocab_size}, min_frequency={min_frequency}"
+    )
+
+    # Create the folder for saving
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+    # Get directory and filename from save_path
+    save_dir = os.path.dirname(save_path)
+
+    # Initialize a base tokenizer (we'll use this to train a new one)
+    base_tokenizer = BertTokenizerFast.from_pretrained(
+        "bert-base-uncased", do_lower_case=True
+    )
+
+    # Define the special tokens we want to include
+    special_tokens = ["[UNK]", "[PAD]", "[CLS]", "[SEP]", "[MASK]"]
+
+    # Train a new tokenizer on the corpus without passing special_tokens directly
+    # The base tokenizer already has these special tokens defined
+    new_tokenizer = base_tokenizer.train_new_from_iterator(
+        texts,
+        vocab_size=vocab_size,
+        min_frequency=min_frequency,
+    )
+
+    # Make sure our special tokens are in the vocabulary
+    # This step ensures the special tokens have the expected token IDs
+    new_tokenizer.add_special_tokens(
+        {
+            "pad_token": "[PAD]",
+            "unk_token": "[UNK]",
+            "cls_token": "[CLS]",
+            "sep_token": "[SEP]",
+            "mask_token": "[MASK]",
+        }
+    )
+
+    # Save the tokenizer
+    new_tokenizer.save_pretrained(save_dir)
+    logger.info(f"Tokenizer saved to {save_dir}")
+
+    return new_tokenizer
+
+
 def main():
     # Set random seed
     set_seed(42)
@@ -367,9 +488,10 @@ def main():
     batch_size = 4  # Reduced from 8
 
     # Training settings - moved earlier to avoid NameError
-    num_epochs = 25
+    num_epochs = 8
     checkpoint_path = "checkpoints/best_model.pt"
     history_path = "checkpoints/training_history.png"
+    tokenizer_path = "checkpoints/vocab.txt"
 
     # Empty cache before starting
     if torch.cuda.is_available():
@@ -384,7 +506,7 @@ def main():
     )
 
     ds_raw = dataset["full"].select_columns(["text", "rating"])
-    ds_raw = ds_raw.select(range(20000))
+    ds_raw = ds_raw.select(range(250000))
 
     # Extract texts and ratings
     texts = [clean_text(text) for text in ds_raw["text"]]
@@ -406,7 +528,7 @@ def main():
 
     # Use stratified sampling to maintain rating distribution
     train_texts, val_texts, train_labels, val_labels = train_test_split(
-        texts, ratings, test_size=0.1, random_state=42, stratify=ratings
+        texts, ratings, test_size=0.2, random_state=42, stratify=ratings
     )
 
     # When processing Amazon ratings, ensure they're in the valid range
@@ -463,7 +585,39 @@ def main():
     num_classes = 5
     logger.info(f"Using {num_classes} classes for classification")
 
-    # Model initialization
+    # Train WordPiece tokenizer on training texts (before model initialization)
+    custom_tokenizer = None
+    if not os.path.exists(tokenizer_path):
+        logger.info("Training tokenizer from scratch...")
+        custom_tokenizer = train_and_save_tokenizer(
+            train_texts,
+            vocab_size=config.vocab_size,
+            min_frequency=2,
+            save_path=tokenizer_path,
+        )
+    else:
+        logger.info(f"Loading pre-trained tokenizer from {tokenizer_path}")
+        tokenizer_dir = os.path.dirname(tokenizer_path)
+        custom_tokenizer = BertTokenizerFast.from_pretrained(tokenizer_dir)
+
+    # Log tokenizer vocabulary statistics
+    if custom_tokenizer:
+        logger.info(f"Tokenizer vocabulary size: {len(custom_tokenizer.vocab)}")
+        # Sample a few texts to test tokenization
+        sample_texts = train_texts[:3]
+        for text in sample_texts:
+            tokens = custom_tokenizer.tokenize(text[:100])  # First 100 chars only
+            logger.info(f"Sample tokenization: {tokens}")
+
+    # Calculate class weights for balanced loss
+    class_weights = create_class_weight(
+        [r - 1 for r in train_labels], num_classes=num_classes
+    )
+    weight_tensor = torch.FloatTensor(
+        [class_weights[i] for i in range(num_classes)]
+    ).to(device)
+
+    # Model initialization remains unchanged
     model = Encoder(
         d_model=config.hidden_size,
         num_heads=config.num_heads,
@@ -471,32 +625,39 @@ def main():
         num_layers=config.Layer,
         max_sequence_length=config.max_position_embeddings,
         use_bert_tokenization=True,
-        corpus=train_texts,  # Build vocabulary from training corpus
-        num_classes=num_classes,  # Pass number of classes
+        corpus=None,
+        vocab_file=tokenizer_path,
+        num_classes=num_classes,
     ).to(device)
 
-    # Optimizer and loss function with label smoothing
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=3e-4,
-        weight_decay=1e-2,  # Reduced weight decay
-        betas=(0.9, 0.999),  # Default betas
+        weight_decay=1e-2,
+        betas=(0.9, 0.999),
     )
 
-    # Use label smoothing for better regularization
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    # >>> CHANGE: Use a lower gamma in FocalLoss for more stable training
+    criterion = FocalLoss(gamma=1.0, weight=weight_tensor)
+    # <<< End change
+
+    # ...existing scheduler initialization...
+
+    # (Optional) To combat overfitting further, you may try:
+    #   - Increasing dropout in embedding and classifier layers.
+    #   - Introducing data augmentation on the minority classes.
+    #   - Adjusting early stopping patience.
 
     # Add learning rate scheduler
     # Instead of ReduceLROnPlateau, use OneCycleLR for better convergence
-    total_steps = len(train_loader) * num_epochs
     scheduler = OneCycleLR(
         optimizer,
-        max_lr=3e-4,
-        total_steps=total_steps,
-        pct_start=0.1,  # Warmup for 10% of training
-        anneal_strategy="cos",
-        div_factor=25.0,
-        final_div_factor=10000.0,
+        max_lr=2e-4,  # Increase max_lr
+        total_steps=len(train_loader) * num_epochs // gradient_accumulation_steps,
+        pct_start=0.2,
+        anneal_strategy="linear",
+        div_factor=10.0,  # Smaller div_factor
+        final_div_factor=50.0,  # Smaller final_div_factor
     )
 
     # Let's keep ReduceLROnPlateau as a backup if you prefer it
@@ -505,7 +666,7 @@ def main():
     # )
 
     # Setup for early stopping - now using both loss and accuracy
-    early_stopping_patience = 10
+    early_stopping_patience = 5
     early_stopping_counter = 0
     best_val_accuracy = 0.0
 
@@ -513,6 +674,10 @@ def main():
     model, optimizer, scheduler, start_epoch, best_val_loss, history = load_checkpoint(
         model, optimizer, scheduler, checkpoint_path
     )
+
+    early_stopping_counter = 0
+    early_stopping_patience = 5
+    best_val_loss = float("inf")
 
     # Training loop
     for epoch in range(start_epoch, num_epochs):
@@ -524,6 +689,7 @@ def main():
             criterion,
             device,
             gradient_accumulation_steps=gradient_accumulation_steps,
+            scheduler=scheduler,
         )
         logger.info(f"Epoch {epoch+1}/{num_epochs} - Train loss: {train_loss:.4f}")
 
@@ -572,7 +738,7 @@ def main():
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            improved = True
+            early_stopping_counter = 0
             save_checkpoint(
                 model,
                 optimizer,
@@ -611,7 +777,7 @@ def main():
             )
 
             if early_stopping_counter >= early_stopping_patience:
-                logger.info("Early stopping triggered!")
+                logger.info(f"Early stopping triggered after {epoch+1} epochs")
                 break
 
     # Enhanced plot for training history
