@@ -3,6 +3,9 @@ import torch.nn as nn
 import math
 from bert_tokenizer import WordPieceTokenizer
 
+# Add transformers imports
+from transformers import BertTokenizer, BertTokenizerFast
+
 
 def get_device():
     return "cuda" if torch.cuda.is_available() else "cpu"
@@ -21,8 +24,9 @@ class SentenceEmbedding(nn.Module):
         PADDING_TOKEN,
     ):
         super().__init__()
-        self.vocab_size = len(language_to_index)
         self.max_sequence_length = max_sequence_length
+        # Fix bug: Define vocab_size before using it
+        self.vocab_size = len(language_to_index)
         self.embedding = nn.Embedding(self.vocab_size, d_model)
         self.language_to_index = language_to_index
         self.position_encoder = PosEncoding(d_model, max_sequence_length)
@@ -81,24 +85,27 @@ class SentenceEmbedding(nn.Module):
         # Apply embedding
         x = self.embedding(x)
 
-        # Create query/key tensors for positional encoding
+        # Apply positional encoding
         batch_size, seq_len = x.shape[:2]
         q = k = x.view(batch_size, seq_len, 1, -1)  # Add head dimension
 
-        # Apply positional encoding
+        # Apply positional encoding and get rotated queries and keys
         q_rotated, k_rotated = self.position_encoder(q, k)
 
-        # Reshape back and use the positional encoded queries
+        # Store the positional information for later use in attention
         x = q_rotated.squeeze(2)  # Remove head dimension
 
         # Apply dropout
         x = self.dropout(x)
 
+        # Store positionally-encoded key for later use
+        x.k_rotated = k_rotated.squeeze(2)
+
         return x
 
 
 class BERTSentenceEmbedding(nn.Module):
-    """BERT-style sentence embedding with custom tokenizer"""
+    """BERT-style sentence embedding with Hugging Face tokenizer"""
 
     def __init__(
         self,
@@ -111,10 +118,16 @@ class BERTSentenceEmbedding(nn.Module):
         super().__init__()
 
         # Initialize the tokenizer
-        self.tokenizer = WordPieceTokenizer(vocab_file)
-        if corpus and not vocab_file:
-            # Build vocabulary if corpus provided and no vocab file
+        if vocab_file:
+            # Use specified vocab file with Hugging Face tokenizer
+            self.tokenizer = BertTokenizerFast(vocab_file=vocab_file)
+        elif corpus:
+            # For custom vocabulary training, fall back to custom tokenizer
+            self.tokenizer = WordPieceTokenizer()
             self.tokenizer.build_vocab(corpus)
+        else:
+            # Default to pretrained BERT tokenizer
+            self.tokenizer = BertTokenizerFast.from_pretrained("bert-base-uncased")
 
         # Set constants for compatibility
         self.max_sequence_length = max_sequence_length
@@ -126,7 +139,7 @@ class BERTSentenceEmbedding(nn.Module):
         self.vocab_size = (
             custom_vocab_size
             if custom_vocab_size is not None
-            else self.tokenizer.vocab_size
+            else len(self.tokenizer.vocab)
         )
         self.embedding = nn.Embedding(self.vocab_size, d_model)
 
@@ -138,35 +151,39 @@ class BERTSentenceEmbedding(nn.Module):
         self.language_to_index = self.tokenizer.vocab
 
     def batch_tokenize(self, batch, start_token, end_token):
-        """Tokenize a batch of sentences"""
-        tokenized = []
-        for sentence in batch:
-            # Use tokenizer to encode text
-            token_ids = self.tokenizer.encode(
-                sentence,
-                max_length=self.max_sequence_length,
-                add_special_tokens=start_token or end_token,
-            )
-            tokenized.append(torch.tensor(token_ids))
+        """Tokenize a batch of sentences using Hugging Face tokenizer"""
+        encoded_batch = self.tokenizer(
+            batch,
+            padding="max_length",
+            truncation=True,
+            max_length=self.max_sequence_length,
+            add_special_tokens=start_token or end_token,
+            return_tensors="pt",
+        )
 
-        tokenized = torch.stack(tokenized)
-        return tokenized.to(get_device())
+        # Get the input ids
+        token_ids = encoded_batch["input_ids"].to(get_device())
+        return token_ids
 
     def forward(self, x, start_token, end_token):
         x = self.batch_tokenize(x, start_token, end_token)
         x = self.embedding(x)
 
-        # Create query/key tensors for position encoding
+        # Apply positional encoding
         batch_size, seq_len = x.shape[:2]
         q = k = x.view(batch_size, seq_len, 1, -1)  # Add head dimension
 
         # Apply positional encoding
         q_rotated, k_rotated = self.position_encoder(q, k)
 
-        # Reshape back and use the positional encoded queries
+        # Use the positional encoded queries
         x = q_rotated.squeeze(2)  # Remove head dimension
 
         x = self.dropout(x)
+
+        # Store positionally-encoded key for later use
+        x.k_rotated = k_rotated.squeeze(2)
+
         return x
 
 
@@ -291,10 +308,11 @@ class MultiHeadAttention(nn.Module):
         self.num_heads = num_heads
         assert d_model % num_heads == 0  # Ensure d_model is divisible by num_heads
         self.head_dim = d_model // num_heads
-        # self.dropout = nn.Dropout(dropout)
 
         # Linear transformations for Q, K, V
-        self.qkv = nn.Linear(d_model, d_model * 3)
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
 
         # Output linear transformation
         self.linear_out = nn.Linear(d_model, d_model)
@@ -302,28 +320,46 @@ class MultiHeadAttention(nn.Module):
         # Scaled dot-product attention
         self.scale = 1 / math.sqrt(self.head_dim)
 
+        # Position encoding as a fallback if not provided by embedding layer
+        self.pos_encoding = PosEncoding(self.head_dim, 512)
+
     def forward(self, x, mask=None):
         B, T, C = x.size()
-        qkv = self.qkv(x)
-        q, k, v = qkv.split(self.d_model, dim=2)
-        assert C % self.num_heads == 0, "d_model must be divisible by num_heads"
-        q = q.view(B, T, self.num_heads, C // self.num_heads).transpose(
-            1, 2
-        )  # [B, num_heads, T, head_dim]
-        k = k.view(B, T, self.num_heads, C // self.num_heads).transpose(
-            1, 2
-        )  # [B, num_heads, T, head_dim]
-        v = v.view(B, T, self.num_heads, C // self.num_heads).transpose(
-            1, 2
-        )  # [B, num_heads, T, head_dim]
 
-        # Scaled dot-product attention
-        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        # Project queries, keys, values
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
 
-        # Apply mask if provided - mask should now have correct shape for broadcasting
+        # Reshape for multi-head attention
+        q = q.view(B, T, self.num_heads, C // self.num_heads)
+        k = k.view(B, T, self.num_heads, C // self.num_heads)
+        v = v.view(B, T, self.num_heads, C // self.num_heads)
+
+        # Check if x has stored positional-encoded key
+        has_encoded_key = hasattr(x, "k_rotated")
+
+        # Apply positional encoding if not already applied
+        if has_encoded_key:
+            # Use the pre-computed positionally-encoded key
+            k_rotated = x.k_rotated.view(B, T, self.num_heads, C // self.num_heads)
+            # Apply positional encoding to queries
+            q_rotated, _ = self.pos_encoding(q, q)
+        else:
+            # Apply positional encoding to both queries and keys
+            q_rotated, k_rotated = self.pos_encoding(q, k)
+
+        # Transpose to get [batch_size, num_heads, seq_len, head_dim]
+        q_rotated = q_rotated.transpose(1, 2)
+        k_rotated = k_rotated.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        # Scaled dot-product attention with rotated queries and keys
+        scores = torch.matmul(q_rotated, k_rotated.transpose(-2, -1)) * self.scale
+
+        # Apply mask if provided
         if mask is not None:
             # Make sure mask shape is compatible with scores
-            # mask shape: [B, 1, 1, T] will broadcast to [B, num_heads, T, T]
             scores = scores.masked_fill(mask == 0, -1e9)
 
         attention = torch.softmax(scores, dim=-1)
@@ -346,7 +382,6 @@ class RMSNorm(nn.Module):
     3. Has better numerical stability and computational efficiency
 
     Paper: "Root Mean Square Layer Normalization" (https://arxiv.org/abs/1910.07467)
-
     Args:
         dim (int): The feature dimension to normalize over
         eps (float): A small constant for numerical stability
@@ -394,10 +429,8 @@ class EncodingLayer(nn.Module):
             # Pre-norm version (more stable)
             residual = x
             x = self.norm1(x)
-            ### Old one
-            ### x = self.attn(x, x, x, mask)
 
-            ### Fix
+            # Pass mask to attention
             x = self.attn(x, mask)
 
             x = self.dropout1(x)
@@ -411,7 +444,8 @@ class EncodingLayer(nn.Module):
         else:
             # Post-norm version (original)
             residual = x
-            x = self.attn(x, x, x, mask)
+            # Updated to use proper mask
+            x = self.attn(x, mask)
             x = self.dropout1(x)
             x = self.norm1(x + residual)
 
@@ -473,15 +507,17 @@ class Encoder(nn.Module):
         )
 
         # Add classification head
-        self.classifier = nn.Linear(d_model, num_classes)
         self.norm = RMSNorm(d_model)
-        self.pooling_type = "cls"  # Options: 'cls', 'mean', 'max'
-
-        # Improve model with additional regularization
         self.input_dropout = nn.Dropout(drop_prob + 0.1)  # Higher dropout at input
 
         # Add layer normalization before pooling
         self.pre_pooling_norm = RMSNorm(d_model)
+
+        # Support for different pooling strategies
+        self.pooling_type = "cls"  # Options: 'cls', 'mean', 'max', 'weighted'
+        if self.pooling_type == "weighted":
+            # Learnable weights for attention pooling
+            self.attention_pool = nn.Linear(d_model, 1)
 
         # Enhance classifier with a better head
         self.classifier = nn.Sequential(
@@ -493,12 +529,6 @@ class Encoder(nn.Module):
 
         # Initialize weights properly
         self.apply(self._init_weights)
-
-        # Support for different pooling strategies
-        self.pooling_type = "weighted"  # Options: 'cls', 'mean', 'max', 'weighted'
-        if self.pooling_type == "weighted":
-            # Learnable weights for attention pooling
-            self.attention_pool = nn.Linear(d_model, 1)
 
     def _init_weights(self, module):
         """Initialize the weights"""
@@ -541,5 +571,4 @@ class Encoder(nn.Module):
 
         # Classify with improved classification head
         logits = self.classifier(pooled)
-
         return logits
